@@ -1,0 +1,141 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+#  Creates a VPC named VPC-chamer1917 in us-west-2 spanning at least 3 AZs
+  (3 public subnets, IGW, route table). If deployed outside us-west-2, resources
+  will not be created (template requires deployment to us-west-2).
+#11/15/2025
+Parameters:
+  StudentID:
+    Type: String
+    Default: chamer1917
+    Description: "ECPI student ID (used in VPC Name). Default set to your ID."
+
+Conditions:
+  IsUsWest2: !Equals [ !Ref "AWS::Region", "us-west-2" ]
+
+Resources:
+
+  # VPC (created only if region == us-west-2)
+  VPC:
+    Type: AWS::EC2::VPC
+    Condition: IsUsWest2
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "VPC-${StudentID}"
+        - Key: CreatedBy
+          Value: CloudFormation
+
+  # Internet Gateway + attachment
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: IsUsWest2
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "igw-${StudentID}"
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: IsUsWest2
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Public Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: IsUsWest2
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "public-rt-${StudentID}"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Condition: IsUsWest2
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Create 3 public subnets across the first 3 AZs in the region
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: IsUsWest2
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "public-subnet-1-${StudentID}"
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: IsUsWest2
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "public-subnet-2-${StudentID}"
+
+  PublicSubnetC:
+    Type: AWS::EC2::Subnet
+    Condition: IsUsWest2
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [2, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "public-subnet-3-${StudentID}"
+
+  # Associate the subnets with the public route table
+  PublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: IsUsWest2
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: IsUsWest2
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetCRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: IsUsWest2
+    Properties:
+      SubnetId: !Ref PublicSubnetC
+      RouteTableId: !Ref PublicRouteTable
+
+Outputs:
+  VPCId:
+    Description: VPC Id (created only in us-west-2)
+    Value: !If [ IsUsWest2, !Ref VPC, "Not created: deploy to us-west-2" ]
+
+  PublicSubnet1:
+    Description: Public subnet 1 id
+    Value: !If [ IsUsWest2, !Ref PublicSubnetA, "Not created: deploy to us-west-2" ]
+
+  PublicSubnet2:
+    Description: Public subnet 2 id
+    Value: !If [ IsUsWest2, !Ref PublicSubnetB, "Not created: deploy to us-west-2" ]
+
+  PublicSubnet3:
+    Description: Public subnet 3 id
+    Value: !If [ IsUsWest2, !Ref PublicSubnetC, "Not created: deploy to us-west-2" ]
