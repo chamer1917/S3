@@ -1,0 +1,8 @@
+  GNU nano 7.2                          calab-bucket.jinja                                    
+{% set bucket_location = 'us-central1' -%}
+resources:
+- name: calab-bucket-1917
+  type: storage.v1.bucket
+  properties:
+    location: {{ bucket_location }}
+    kind: storage#bucket

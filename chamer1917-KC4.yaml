@@ -1,0 +1,354 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Scalable web application with ALB, AutoScaling (min 2 max 4), backend EC2 with EBS,
+  and S3 bucket with versioning enabled.
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair for SSH access to instances
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for web and backend
+  SSHLocation:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: The IP address range that can be used to SSH to the instances (CIDR)
+
+Mappings:
+  # Map to use Amazon Linux 2 AMI per region (example for common regions)
+  AmazonLinux2Ami:
+    us-west-2:
+      ami: ami-0c5204531f799e0c6  # Update if needed; CloudFormation will pick this, or supply your own AMI via parameter
+
+Conditions:
+  UseDefaultAmi: !Equals [!FindInMap [AmazonLinux2Ami, !Ref "AWS::Region", ami], ""]
+
+Resources:
+
+  ### Networking - VPC, Subnets, IGW, Route Table
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "cf-scalable-app-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: cf-scalable-app-igw
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Create 2 public subnets in two different AZs
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs "" ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: public-subnet-a
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [ 1, !GetAZs "" ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: public-subnet-b
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+
+  ### Security Groups
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP (80) from the world to ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: alb-sg
+
+  WebInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow traffic from ALB and SSH from SSHLocation
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+      Tags:
+        - Key: Name
+          Value: web-sg
+
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow access from web instances only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref WebInstanceSecurityGroup
+      Tags:
+        - Key: Name
+          Value: backend-sg
+
+  ### IAM Role and Instance Profile (for SSM or S3 access if extended later)
+  WebInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  WebInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WebInstanceRole
+      Path: /
+
+  ### Application Load Balancer
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: cf-app-alb
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Scheme: internet-facing
+      Type: application
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: cf-app-tg
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+
+  AppListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+  ### Launch Template for Auto Scaling Group (web app)
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !Ref WebInstanceSecurityGroup
+        IamInstanceProfile:
+          Name: !Ref WebInstanceProfile
+        ImageId: !FindInMap [AmazonLinux2Ami, !Ref "AWS::Region", ami]
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              DeleteOnTermination: true
+          # Additional EBS for app data (persisted for the instance lifetime)
+          - DeviceName: /dev/xvdb
+            Ebs:
+              VolumeSize: 50
+              VolumeType: gp3
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd
+            systemctl enable httpd
+            systemctl start httpd
+            echo "<h1>CFN Web App - Instance $(hostname)</h1>" > /var/www/html/index.html
+            # mount /dev/xvdb if present
+            if [ -b /dev/xvdb ]; then
+              mkfs -t xfs /dev/xvdb || true
+              mkdir -p /data
+              mount /dev/xvdb /data || true
+              echo "/dev/xvdb /data xfs defaults,nofail 0 2" >> /etc/fstab || true
+            fi
+
+  WebAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      MinSize: '2'
+      MaxSize: '4'
+      DesiredCapacity: '2'
+      TargetGroupARNs:
+        - !Ref AppTargetGroup
+      MetricsCollection:
+        - Granularity: '1Minute'
+      Tags:
+        - Key: Name
+          Value: cf-web-asg
+          PropagateAtLaunch: true
+
+  ### Backend EC2 instance + EBS volume attached (in a specific AZ)
+  BackendInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: !FindInMap [AmazonLinux2Ami, !Ref "AWS::Region", ami]
+      SubnetId: !Ref PublicSubnetB
+      SecurityGroupIds:
+        - !Ref BackendSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: backend-instance
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y awscli
+          # Example backend service listening on 8080 (simple netcat echo) - for demo only
+          yum install -y xinetd
+          # create a directory for backend data
+          mkdir -p /backend-data
+          echo "Backend service started on port 8080" > /backend-data/README
+
+  BackendDataVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      AvailabilityZone: !GetAtt PublicSubnetB.AvailabilityZone
+      Size: 50
+      VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: backend-data-volume
+
+  BackendVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      Device: /dev/sdf
+      InstanceId: !Ref BackendInstance
+      VolumeId: !Ref BackendDataVolume
+
+  ### S3 bucket for static content with versioning enabled
+  StaticContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "cf-static-content-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: cf-static-content
+
+  ### Outputs
+Outputs:
+  LoadBalancerDNS:
+    Description: URL of the Application Load Balancer
+    Value: !GetAtt AppLoadBalancer.DNSName
+
+  StaticBucketName:
+    Description: S3 bucket for static content
+    Value: !Ref StaticContentBucket
+
+  BackendInstanceId:
+    Description: Backend EC2 instance ID
+    Value: !Ref BackendInstance
+
+  WebAutoScalingGroupName:
+    Description: Name of the web AutoScaling Group
+    Value: !Ref WebAutoScalingGroup

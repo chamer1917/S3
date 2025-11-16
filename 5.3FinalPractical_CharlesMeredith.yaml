@@ -1,0 +1,610 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation template for TechSavvy Solutions e-commerce infra:
+  VPC (public/private subnets across 2 AZs), ALB -> web EC2 ASG,
+  application EC2 ASG in private subnets, Multi-AZ RDS MySQL, SecurityGroups, IAM roles.
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to instances
+    Type: AWS::EC2::KeyPair::KeyName
+  VpcCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC
+  PublicSubnet1CIDR:
+    Type: String
+    Default: 10.0.0.0/24
+  PublicSubnet2CIDR:
+    Type: String
+    Default: 10.0.1.0/24
+  PrivateAppSubnet1CIDR:
+    Type: String
+    Default: 10.0.10.0/24
+  PrivateAppSubnet2CIDR:
+    Type: String
+    Default: 10.0.11.0/24
+  PrivateDBSubnet1CIDR:
+    Type: String
+    Default: 10.0.20.0/24
+  PrivateDBSubnet2CIDR:
+    Type: String
+    Default: 10.0.21.0/24
+  WebInstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.nano,t3.micro,t3.small,t3.medium,t3.large]
+    Description: EC2 instance type for web servers
+  AppInstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.nano,t3.micro,t3.small,t3.medium,t3.large]
+    Description: EC2 instance type for application servers
+  WebDesiredCapacity:
+    Type: Number
+    Default: 2
+  WebMinSize:
+    Type: Number
+    Default: 2
+  WebMaxSize:
+    Type: Number
+    Default: 4
+  AppDesiredCapacity:
+    Type: Number
+    Default: 2
+  AppMinSize:
+    Type: Number
+    Default: 1
+  AppMaxSize:
+    Type: Number
+    Default: 3
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    Description: Storage in GB for RDS
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium, db.t3.large]
+    Description: RDS instance class
+  DBName:
+    Type: String
+    Default: techsavvydb
+  DBUsername:
+    Type: String
+    Default: admin
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: The database admin account password
+  SSHLocation:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: The IP address range that can be used to SSH to EC2 instances (use your IP)
+  ALBIdleTimeout:
+    Type: Number
+    Default: 60
+    Description: ALB idle timeout in seconds
+
+Mappings:
+  # Amazon Linux 2 AMI via SSM Parameter (region agnostic via mapping)
+  # CloudFormation cannot directly query SSM here so we use AWS provided parameter name pattern for Amazon Linux 2
+  # For safety, we'll use a dynamic AMI lookup with SSM in LaunchConfigurations' ImageId via a lookup using:
+  #   {"Fn::FindInMap": ["RegionMap", {"Ref":"AWS::Region"}, "AMI"]}
+  RegionMap:
+    us-east-1:
+      AMI: ami-0c2b8ca1dad447f8a
+    us-east-2:
+      AMI: ami-038f0d7d6e8f5f5c2
+    us-west-2:
+      AMI: ami-0a887e401f7654935
+    eu-west-1:
+      AMI: ami-07d0cf3af28718ef8
+    # NOTE: Add/adjust AMIs for your target region(s) if needed.
+
+Resources:
+
+  ########################
+  # Networking components
+  ########################
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: TechSavvy-VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: TechSavvy-IGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnets (2 AZs)
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1CIDR
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2CIDR
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet-2
+
+  # Private subnets for application tier
+  PrivateAppSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateAppSubnet1CIDR
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: PrivateAppSubnet-1
+
+  PrivateAppSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateAppSubnet2CIDR
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: PrivateAppSubnet-2
+
+  # Private subnets for DB
+  PrivateDBSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateDBSubnet1CIDR
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: PrivateDBSubnet-1
+
+  PrivateDBSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateDBSubnet2CIDR
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: PrivateDBSubnet-2
+
+  # Route Table and routes for public subnets
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # NAT Gateways for outbound access from private subnets (one in each AZ for HA)
+  EIPNat1:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  EIPNat2:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIPNat1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: NATGateway-1
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIPNat2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: NATGateway-2
+
+  # Route tables for private subnets (app & db) with routes to NAT gateways in same AZ
+  PrivateRouteTableAZ1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PrivateRouteTable-AZ1
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableAZ1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateRouteTableAZ2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PrivateRouteTable-AZ2
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableAZ2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  # Associate private app subnets to route tables
+  PrivateAppSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnet1
+      RouteTableId: !Ref PrivateRouteTableAZ1
+
+  PrivateDBSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDBSubnet1
+      RouteTableId: !Ref PrivateRouteTableAZ1
+
+  PrivateAppSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnet2
+      RouteTableId: !Ref PrivateRouteTableAZ2
+
+  PrivateDBSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDBSubnet2
+      RouteTableId: !Ref PrivateRouteTableAZ2
+
+  ##################################
+  # Security Groups
+  ##################################
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP/HTTPS from the world to ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ALB-SG
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow traffic from ALB and SSH from authorized
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # ALB -> web on 80
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        # SSH from your IP (limit via parameter SSHLocation)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+      Tags:
+        - Key: Name
+          Value: Web-SG
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow traffic from web tier to app tier
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+      Tags:
+        - Key: Name
+          Value: App-SG
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL access from App servers only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+      Tags:
+        - Key: Name
+          Value: DB-SG
+
+  ##################################
+  # IAM Role & Instance Profile
+  ##################################
+
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      RoleName: TechSavvyEC2Role
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2InstanceRole
+
+  ##################################
+  # Load Balancer & Target Group
+  ##################################
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: TechSavvy-ALB
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Type: application
+      IpAddressType: ipv4
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: web-targets
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: '200-399'
+
+  ALBListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+
+  ##################################
+  # Launch Configurations & AutoScaling Groups
+  ##################################
+
+  # Web Launch Configuration
+  WebLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+      InstanceType: !Ref WebInstanceType
+      KeyName: !Ref KeyName
+      SecurityGroups:
+        - !Ref WebSecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # Simple web site install for health checks (replace with your code/deploy method)
+          yum update -y
+          amazon-linux-extras install -y nginx1
+          systemctl enable nginx
+          cat > /usr/share/nginx/html/index.html <<'HTML'
+          <html><body><h1>TechSavvy Web Server - ${AWS::StackName}</h1></body></html>
+          HTML
+          systemctl start nginx
+
+  # App Launch Configuration
+  AppLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+      InstanceType: !Ref AppInstanceType
+      KeyName: !Ref KeyName
+      SecurityGroups:
+        - !Ref AppSecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          # Example app placeholder: a simple python http server on port 8080
+          yum install -y python3
+          cat > /opt/app.py <<'PY'
+          from http.server import SimpleHTTPRequestHandler, HTTPServer
+          class Handler(SimpleHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(200)
+                  self.send_header('Content-type','text/plain')
+                  self.end_headers()
+                  self.wfile.write(b"App tier responding")
+          httpd = HTTPServer(('0.0.0.0', 8080), Handler)
+          httpd.serve_forever()
+          PY
+          nohup python3 /opt/app.py &
+
+  # Web AutoScalingGroup
+  WebAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      LaunchConfigurationName: !Ref WebLaunchConfig
+      MinSize: !Ref WebMinSize
+      MaxSize: !Ref WebMaxSize
+      DesiredCapacity: !Ref WebDesiredCapacity
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      Tags:
+        - Key: Name
+          Value: TechSavvy-Web
+          PropagateAtLaunch: true
+
+  # App AutoScalingGroup
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PrivateAppSubnet1
+        - !Ref PrivateAppSubnet2
+      LaunchConfigurationName: !Ref AppLaunchConfig
+      MinSize: !Ref AppMinSize
+      MaxSize: !Ref AppMaxSize
+      DesiredCapacity: !Ref AppDesiredCapacity
+      Tags:
+        - Key: Name
+          Value: TechSavvy-App
+          PropagateAtLaunch: true
+
+  ##################################
+  # RDS (MySQL) - Multi-AZ
+  ##################################
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for TechSavvy RDS
+      SubnetIds:
+        - !Ref PrivateDBSubnet1
+        - !Ref PrivateDBSubnet2
+      Tags:
+        - Key: Name
+          Value: TechSavvy-DBSubnetGroup
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBName: !Ref DBName
+      AllocatedStorage: !Ref DBAllocatedStorage
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: mysql
+      EngineVersion: 8.0
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      MultiAZ: true
+      PubliclyAccessible: false
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+      StorageType: gp2
+      Tags:
+        - Key: Name
+          Value: TechSavvy-RDS
+
+  ##################################
+  # CloudFormation Outputs
+  ##################################
+
+Outputs:
+  VPCId:
+    Description: VPC Id
+    Value: !Ref VPC
+
+  ALBDNSName:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ALB.DNSName
+
+  RDSAddress:
+    Description: RDS Endpoint (address)
+    Value: !GetAtt RDSInstance.Endpoint.Address
+
+  RDSPort:
+    Description: RDS Endpoint port
+    Value: !GetAtt RDSInstance.Endpoint.Port
+
+  WebAutoScalingGroupName:
+    Description: Auto Scaling Group for web tier
+    Value: !Ref WebAutoScalingGroup
+
+  AppAutoScalingGroupName:
+    Description: Auto Scaling Group for app tier
+    Value: !Ref AppAutoScalingGroup
